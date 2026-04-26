@@ -12,6 +12,7 @@ Run it on a small VPS (or a Pi). Lock it to your own Telegram user ID. Point it 
 - **Optional persona** — drop a `USER.md` into the state dir; it's appended as system prompt
 - **Slash commands** — `/new` (fresh session), `/status`, `/help`
 - **Long replies handled** — Telegram's 4096-char limit is split into chunks
+- **Photo / image-document input** — sent images are downloaded and `@`-referenced in the prompt so claude reads them via the Read tool
 - **systemd unit included** — auto-restart, log to file
 - **Single Python file**, ~250 lines, only dependency is `requests`
 

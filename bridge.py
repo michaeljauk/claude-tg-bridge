@@ -49,6 +49,7 @@ WORK_DIR = Path(os.environ.get("CLAW_WORK_DIR", str(Path.home())))
 STATE_DIR = Path(os.environ.get("CLAW_STATE_DIR", str(Path.home() / ".claude-tg-bridge")))
 STATE_FILE = STATE_DIR / "state.json"
 USER_MD = STATE_DIR / "USER.md"
+UPLOAD_DIR = STATE_DIR / "uploads"
 CLAUDE_TIMEOUT_SEC = int(os.environ.get("CLAUDE_TIMEOUT_SEC", "600"))
 
 LOG_PREFIX = "[claude-tg-bridge]"
@@ -84,6 +85,67 @@ def save_state(state: dict) -> None:
 def tg(method: str, payload: dict) -> dict:
     r = requests.post(f"{API}/{method}", json=payload, timeout=30)
     return r.json()
+
+
+_FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def download_telegram_file(file_id: str, dest_dir: Path) -> Path | None:
+    """Fetch a Telegram file by file_id and save it under dest_dir.
+
+    Returns the local path on success, or None if anything goes wrong (no file
+    path, HTTP error, write error). Capped at Telegram's 20 MB getFile limit.
+    """
+    res = tg("getFile", {"file_id": file_id})
+    if not res.get("ok"):
+        log("getFile failed", res)
+        return None
+    rel = res["result"].get("file_path")
+    if not rel:
+        return None
+    suffix = Path(rel).suffix or ".bin"
+    safe_stem = _FILENAME_SAFE_RE.sub("_", Path(rel).stem) or "file"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{int(time.time())}_{safe_stem}{suffix}"
+    url = f"https://api.telegram.org/file/bot{BOT_TOKEN}/{rel}"
+    try:
+        with requests.get(url, timeout=60, stream=True) as r:
+            if r.status_code != 200:
+                log(f"file download failed: HTTP {r.status_code}")
+                return None
+            with open(dest, "wb") as f:
+                for chunk in r.iter_content(64 * 1024):
+                    f.write(chunk)
+    except requests.RequestException as e:
+        log("file download error", e)
+        return None
+    return dest
+
+
+def extract_message_input(msg: dict) -> tuple[str, list[Path]]:
+    """Pull text/caption + any attached images from a Telegram message.
+
+    Photos: take the largest size variant. Image documents (mime_type
+    image/*): download as-is. Everything else is ignored — we don't try to
+    feed PDFs, audio, or video to claude.
+    """
+    text = (msg.get("text") or msg.get("caption") or "").strip()
+    files: list[Path] = []
+
+    photos = msg.get("photo") or []
+    if photos:
+        largest = photos[-1]
+        f = download_telegram_file(largest["file_id"], UPLOAD_DIR)
+        if f:
+            files.append(f)
+
+    doc = msg.get("document") or {}
+    if doc and (doc.get("mime_type") or "").startswith("image/"):
+        f = download_telegram_file(doc["file_id"], UPLOAD_DIR)
+        if f:
+            files.append(f)
+
+    return text, files
 
 
 _TABLE_RE = re.compile(
@@ -381,22 +443,31 @@ def handle_update(update: dict, state: dict) -> None:
         return
     chat_id = msg["chat"]["id"]
     user_id = msg.get("from", {}).get("id")
-    text = msg.get("text", "")
 
     if user_id not in ALLOWLIST:
         log(f"reject user_id={user_id}")
         return
-    if not text:
-        return
 
     chat_key = str(chat_id)
+
+    text, files = extract_message_input(msg)
 
     if text.startswith("/") and handle_command(chat_id, chat_key, state, text):
         return
 
+    if not text and not files:
+        return
+
+    if files:
+        refs = "\n".join(f"@{p}" for p in files)
+        prompt_caption = text or "What's in this image?"
+        prompt = f"{refs}\n\n{prompt_caption}"
+    else:
+        prompt = text
+
     status_id = send(chat_id, "⏱ 0s · starting")
     try:
-        reply, new_session = run_claude_streaming(text, state, chat_key, chat_id, status_id)
+        reply, new_session = run_claude_streaming(prompt, state, chat_key, chat_id, status_id)
         if new_session:
             state[chat_key] = new_session
             save_state(state)
