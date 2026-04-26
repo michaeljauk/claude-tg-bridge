@@ -13,6 +13,7 @@ Run it on a small VPS (or a Pi). Lock it to your own Telegram user ID. Point it 
 - **Slash commands** — `/new` (fresh session), `/status`, `/help`
 - **Long replies handled** — Telegram's 4096-char limit is split into chunks
 - **Photo / image-document input** — sent images are downloaded and `@`-referenced in the prompt so claude reads them via the Read tool
+- **Concurrent turns** — fire follow-up messages while a long task is still running; the bridge runs them in parallel via a thread pool (cap with `CLAW_MAX_CONCURRENT`)
 - **systemd unit included** — auto-restart, log to file
 - **Single Python file**, ~250 lines, only dependency is `requests`
 

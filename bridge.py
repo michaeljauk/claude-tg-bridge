@@ -33,6 +33,7 @@ import sys
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -51,6 +52,7 @@ STATE_FILE = STATE_DIR / "state.json"
 USER_MD = STATE_DIR / "USER.md"
 UPLOAD_DIR = STATE_DIR / "uploads"
 CLAUDE_TIMEOUT_SEC = int(os.environ.get("CLAUDE_TIMEOUT_SEC", "600"))
+MAX_CONCURRENT_TURNS = max(1, int(os.environ.get("CLAW_MAX_CONCURRENT", "8")))
 
 LOG_PREFIX = "[claude-tg-bridge]"
 API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -492,8 +494,19 @@ def handle_update(update: dict, state: dict) -> None:
             send(chat_id, err)
 
 
+def _run_turn(update: dict, state: dict) -> None:
+    """Wrap handle_update with a top-level catch so a thread crash never kills the pool."""
+    try:
+        handle_update(update, state)
+    except Exception:  # noqa: BLE001
+        log("turn crashed", traceback.format_exc())
+
+
 def main() -> int:
-    log(f"starting; allowlist={sorted(ALLOWLIST)}; cwd={WORK_DIR}; model={CLAUDE_MODEL}")
+    log(
+        f"starting; allowlist={sorted(ALLOWLIST)}; cwd={WORK_DIR}; "
+        f"model={CLAUDE_MODEL}; max_concurrent={MAX_CONCURRENT_TURNS}"
+    )
     if not ALLOWLIST:
         log("FATAL: TELEGRAM_ALLOWLIST is empty — refusing to run")
         return 2
@@ -503,30 +516,36 @@ def main() -> int:
 
     state = load_state()
     offset = 0
-    while True:
-        try:
-            r = requests.get(
-                f"{API}/getUpdates",
-                params={"offset": offset, "timeout": 30},
-                timeout=40,
-            )
-            data = r.json()
-            if not data.get("ok"):
-                log("getUpdates not ok", data)
+    executor = ThreadPoolExecutor(
+        max_workers=MAX_CONCURRENT_TURNS, thread_name_prefix="turn"
+    )
+    try:
+        while True:
+            try:
+                r = requests.get(
+                    f"{API}/getUpdates",
+                    params={"offset": offset, "timeout": 30},
+                    timeout=40,
+                )
+                data = r.json()
+                if not data.get("ok"):
+                    log("getUpdates not ok", data)
+                    time.sleep(5)
+                    continue
+                for u in data["result"]:
+                    offset = u["update_id"] + 1
+                    executor.submit(_run_turn, u, state)
+            except requests.RequestException as e:
+                log("network error", e)
                 time.sleep(5)
-                continue
-            for u in data["result"]:
-                offset = u["update_id"] + 1
-                handle_update(u, state)
-        except requests.RequestException as e:
-            log("network error", e)
-            time.sleep(5)
-        except KeyboardInterrupt:
-            log("interrupted")
-            return 0
-        except Exception:
-            log("loop error", traceback.format_exc())
-            time.sleep(5)
+            except KeyboardInterrupt:
+                log("interrupted")
+                return 0
+            except Exception:
+                log("loop error", traceback.format_exc())
+                time.sleep(5)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=False)
 
 
 if __name__ == "__main__":
