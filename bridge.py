@@ -30,6 +30,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -70,8 +71,14 @@ def load_state() -> dict:
     return {}
 
 
+_state_lock = threading.Lock()
+
+
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    with _state_lock:
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2))
+        tmp.replace(STATE_FILE)
 
 
 def tg(method: str, payload: dict) -> dict:
@@ -164,7 +171,19 @@ def send_chunked(chat_id: int, text: str) -> None:
 
 
 EDIT_THROTTLE_SEC = 1.5
+TICKER_INTERVAL_SEC = 5.0
 TOOL_INPUT_PREVIEW_LEN = 80
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    sec = int(seconds)
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
 
 
 def _summarize_tool_input(name: str, raw_input: dict) -> str:
@@ -220,22 +239,46 @@ def run_claude_streaming(
         cwd=str(WORK_DIR),
     )
 
+    start_ts = time.monotonic()
+    deadline = start_ts + CLAUDE_TIMEOUT_SEC
     new_session: str | None = None
-    final_text = ""
-    last_text = ""
-    last_status = ""
+    state_box = {"text": "", "status": "started"}
+    last_rendered = ""
     last_edit_ts = 0.0
-    deadline = time.monotonic() + CLAUDE_TIMEOUT_SEC
+    edit_lock = threading.Lock()
 
-    def maybe_edit(text: str, force: bool = False) -> None:
-        nonlocal last_edit_ts
+    def render() -> str:
+        elapsed = _fmt_elapsed(time.monotonic() - start_ts)
+        footer = f"⏱ {elapsed} · {state_box['status']}"
+        text = state_box["text"]
+        if text:
+            avail = TG_MAX - len(footer) - 4
+            return f"{text[:avail]}\n\n{footer}"
+        return footer
+
+    def push(force: bool = False) -> None:
+        nonlocal last_edit_ts, last_rendered
         if not status_id:
             return
         now = time.monotonic()
         if not force and (now - last_edit_ts) < EDIT_THROTTLE_SEC:
             return
-        edit(chat_id, status_id, text)
+        rendered = render()
+        if rendered == last_rendered and not force:
+            return
+        edit(chat_id, status_id, rendered)
+        last_rendered = rendered
         last_edit_ts = now
+
+    ticker_stop = threading.Event()
+
+    def ticker() -> None:
+        while not ticker_stop.wait(TICKER_INTERVAL_SEC):
+            with edit_lock:
+                push()
+
+    ticker_thread = threading.Thread(target=ticker, daemon=True)
+    ticker_thread.start()
 
     try:
         assert proc.stdout is not None
@@ -259,7 +302,9 @@ def run_claude_streaming(
             t = ev.get("type")
 
             if t == "system" and ev.get("subtype") == "init":
-                maybe_edit("status: started", force=True)
+                with edit_lock:
+                    state_box["status"] = "started"
+                    push(force=True)
                 continue
 
             if t == "assistant":
@@ -268,27 +313,27 @@ def run_claude_streaming(
                     btype = block.get("type")
                     if btype == "text":
                         txt = block.get("text", "")
-                        if txt:
-                            final_text = txt
-                            if final_text != last_text:
-                                last_text = final_text
-                                maybe_edit(final_text[:TG_MAX])
+                        if txt and txt != state_box["text"]:
+                            with edit_lock:
+                                state_box["text"] = txt
+                                push()
                     elif btype == "tool_use":
                         label = _summarize_tool_input(block.get("name", "tool"), block.get("input", {}))
-                        status_msg = f"status: {label}"
-                        if status_msg != last_status:
-                            last_status = status_msg
-                            maybe_edit(status_msg, force=True)
+                        if label != state_box["status"]:
+                            with edit_lock:
+                                state_box["status"] = label
+                                push(force=True)
                     elif btype == "thinking":
-                        if last_status != "status: thinking":
-                            last_status = "status: thinking"
-                            maybe_edit(last_status)
+                        if state_box["status"] != "thinking":
+                            with edit_lock:
+                                state_box["status"] = "thinking"
+                                push()
                 continue
 
             if t == "result":
                 final_from_result = ev.get("result")
                 if final_from_result:
-                    final_text = final_from_result
+                    state_box["text"] = final_from_result
                 break
 
         proc.wait(timeout=10)
@@ -300,10 +345,11 @@ def run_claude_streaming(
         proc.kill()
         return f"[timeout after {CLAUDE_TIMEOUT_SEC}s]", new_session
     finally:
+        ticker_stop.set()
         if proc.poll() is None:
             proc.kill()
 
-    return final_text or "(no text produced)", new_session
+    return state_box["text"] or "(no text produced)", new_session
 
 
 def handle_command(chat_id: int, chat_key: str, state: dict, text: str) -> bool:
