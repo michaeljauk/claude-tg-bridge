@@ -23,8 +23,10 @@ Optional file at $CLAW_STATE_DIR/USER.md is appended as system prompt.
 
 from __future__ import annotations
 
+import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -77,8 +79,62 @@ def tg(method: str, payload: dict) -> dict:
     return r.json()
 
 
+_TABLE_RE = re.compile(
+    r"(^\|.*\|[ \t]*\n^\|[\s\-:|]+\|[ \t]*\n(?:^\|.*\|[ \t]*\n?)+)",
+    re.MULTILINE,
+)
+_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+\-]*\n?(.*?)```", re.DOTALL)
+_INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
+_BOLD_RE = re.compile(r"\*\*([^*\n]+)\*\*")
+_HEADING_RE = re.compile(r"^#{1,6}\s+(.+?)\s*$", re.MULTILINE)
+_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(([^)\s]+)\)")
+
+
+def md_to_html(text: str) -> str:
+    """Convert Claude's markdown to Telegram-flavored HTML.
+
+    Tables become <pre> blocks (Telegram has no table primitive). Code fences
+    and inline code are escaped + wrapped. Bold, headings, and links are
+    converted. Everything else is HTML-escaped so stray <>& don't break parse.
+    """
+    blocks: list[tuple[str, str]] = []
+
+    def stash(content: str, tag: str) -> str:
+        blocks.append((tag, content))
+        return f"\x00{len(blocks) - 1}\x00"
+
+    text = _TABLE_RE.sub(lambda m: stash(m.group(1).rstrip(), "pre"), text)
+    text = _FENCE_RE.sub(lambda m: stash(m.group(1), "pre"), text)
+    text = _INLINE_CODE_RE.sub(lambda m: stash(m.group(1), "code"), text)
+
+    text = html.escape(text, quote=False)
+
+    text = _HEADING_RE.sub(r"<b>\1</b>", text)
+    text = _BOLD_RE.sub(r"<b>\1</b>", text)
+    text = _LINK_RE.sub(r'<a href="\2">\1</a>', text)
+
+    def restore(m: re.Match) -> str:
+        tag, content = blocks[int(m.group(1))]
+        return f"<{tag}>{html.escape(content, quote=False)}</{tag}>"
+
+    return re.sub(r"\x00(\d+)\x00", restore, text)
+
+
+def _send_or_edit(method: str, payload: dict) -> dict:
+    """Try with HTML parse_mode; on parse error retry as plain text."""
+    res = tg(method, {**payload, "parse_mode": "HTML"})
+    if res.get("ok"):
+        return res
+    desc = (res.get("description") or "").lower()
+    if "parse" in desc and ("entit" in desc or "tag" in desc):
+        # malformed HTML — fall back to plain text so the message still lands
+        return tg(method, payload)
+    return res
+
+
 def send(chat_id: int, text: str) -> int | None:
-    res = tg("sendMessage", {"chat_id": chat_id, "text": text[:TG_MAX]})
+    payload = {"chat_id": chat_id, "text": md_to_html(text[:TG_MAX])}
+    res = _send_or_edit("sendMessage", payload)
     if not res.get("ok"):
         log("sendMessage failed", res)
         return None
@@ -86,10 +142,12 @@ def send(chat_id: int, text: str) -> int | None:
 
 
 def edit(chat_id: int, message_id: int, text: str) -> None:
-    res = tg(
-        "editMessageText",
-        {"chat_id": chat_id, "message_id": message_id, "text": text[:TG_MAX]},
-    )
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": md_to_html(text[:TG_MAX]),
+    }
+    res = _send_or_edit("editMessageText", payload)
     if not res.get("ok"):
         # "message is not modified" is benign — Telegram rejects no-op edits.
         if "not modified" in (res.get("description") or "").lower():
