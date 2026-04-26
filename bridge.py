@@ -75,6 +75,30 @@ def load_state() -> dict:
 
 
 _state_lock = threading.Lock()
+_main_slot_lock = threading.Lock()
+_main_slot_inflight: set[str] = set()
+
+
+def claim_main_slot(chat_key: str) -> bool:
+    """Claim the 'main' (continuity-bearing) slot for chat_key.
+
+    The first turn for a chat with no in-flight main becomes the main turn:
+    its resulting session_id is written back to state.json so the chat keeps
+    a coherent thread of continuity. Concurrent turns that arrive while a
+    main is in flight run as 'sidebar' — they still --resume from the same
+    parent and have full context, but their session_id is discarded so they
+    can't fork the main chain.
+    """
+    with _main_slot_lock:
+        if chat_key in _main_slot_inflight:
+            return False
+        _main_slot_inflight.add(chat_key)
+        return True
+
+
+def release_main_slot(chat_key: str) -> None:
+    with _main_slot_lock:
+        _main_slot_inflight.discard(chat_key)
 
 
 def save_state(state: dict) -> None:
@@ -270,8 +294,12 @@ def run_claude_streaming(
     chat_key: str,
     chat_id: int,
     status_id: int | None,
+    is_sidebar: bool = False,
 ) -> tuple[str, str | None]:
     """Run claude with stream-json, edit Telegram message as events arrive.
+
+    is_sidebar only changes how the live status footer is labelled — the
+    caller decides whether to write the resulting session_id back to state.
 
     Returns (final_text, session_id).
     """
@@ -311,9 +339,11 @@ def run_claude_streaming(
     last_edit_ts = 0.0
     edit_lock = threading.Lock()
 
+    sidebar_tag = " · sidebar" if is_sidebar else ""
+
     def render() -> str:
         elapsed = _fmt_elapsed(time.monotonic() - start_ts)
-        footer = f"⏱ {elapsed} · {state_box['status']}"
+        footer = f"⏱ {elapsed}{sidebar_tag} · {state_box['status']}"
         text = state_box["text"]
         if text:
             avail = TG_MAX - len(footer) - 4
@@ -467,10 +497,14 @@ def handle_update(update: dict, state: dict) -> None:
     else:
         prompt = text
 
-    status_id = send(chat_id, "⏱ 0s · starting")
+    is_main = claim_main_slot(chat_key)
+    initial_status = "⏱ 0s · starting" if is_main else "⏱ 0s · sidebar · starting"
+    status_id = send(chat_id, initial_status)
     try:
-        reply, new_session = run_claude_streaming(prompt, state, chat_key, chat_id, status_id)
-        if new_session:
+        reply, new_session = run_claude_streaming(
+            prompt, state, chat_key, chat_id, status_id, is_sidebar=not is_main
+        )
+        if is_main and new_session:
             state[chat_key] = new_session
             save_state(state)
         if status_id and len(reply) <= TG_MAX:
@@ -492,6 +526,9 @@ def handle_update(update: dict, state: dict) -> None:
             edit(chat_id, status_id, err)
         else:
             send(chat_id, err)
+    finally:
+        if is_main:
+            release_main_slot(chat_key)
 
 
 def _run_turn(update: dict, state: dict) -> None:
