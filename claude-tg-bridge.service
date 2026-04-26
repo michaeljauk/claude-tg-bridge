@@ -1,0 +1,18 @@
+[Unit]
+Description=claude-tg-bridge (Telegram <-> claude --print, Plan tokens)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.claude-tg-bridge/env
+ExecStart=/usr/bin/python3 %h/claude-tg-bridge/bridge.py
+Restart=always
+RestartSec=5
+StartLimitBurst=5
+StartLimitIntervalSec=60
+StandardOutput=append:%h/.claude-tg-bridge/bridge.log
+StandardError=append:%h/.claude-tg-bridge/bridge.log
+
+[Install]
+WantedBy=default.target
