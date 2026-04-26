@@ -91,6 +91,9 @@ def edit(chat_id: int, message_id: int, text: str) -> None:
         {"chat_id": chat_id, "message_id": message_id, "text": text[:TG_MAX]},
     )
     if not res.get("ok"):
+        # "message is not modified" is benign — Telegram rejects no-op edits.
+        if "not modified" in (res.get("description") or "").lower():
+            return
         log("editMessageText failed", res)
 
 
@@ -102,12 +105,41 @@ def send_chunked(chat_id: int, text: str) -> None:
         send(chat_id, text[i : i + TG_MAX])
 
 
-def run_claude(message: str, state: dict, chat_key: str) -> tuple[str, str | None]:
+EDIT_THROTTLE_SEC = 1.5
+TOOL_INPUT_PREVIEW_LEN = 80
+
+
+def _summarize_tool_input(name: str, raw_input: dict) -> str:
+    """Pick a short, human-readable hint from a tool_use block's input."""
+    if not isinstance(raw_input, dict):
+        return name
+    for key in ("description", "command", "pattern", "file_path", "path", "url", "query", "prompt"):
+        v = raw_input.get(key)
+        if isinstance(v, str) and v:
+            v = v.replace("\n", " ").strip()
+            if len(v) > TOOL_INPUT_PREVIEW_LEN:
+                v = v[:TOOL_INPUT_PREVIEW_LEN - 1] + "…"
+            return f"{name}({v})"
+    return name
+
+
+def run_claude_streaming(
+    message: str,
+    state: dict,
+    chat_key: str,
+    chat_id: int,
+    status_id: int | None,
+) -> tuple[str, str | None]:
+    """Run claude with stream-json, edit Telegram message as events arrive.
+
+    Returns (final_text, session_id).
+    """
     args = [
         CLAUDE_BIN,
         "--print",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
         "--permission-mode",
         "bypassPermissions",
         "--model",
@@ -119,25 +151,101 @@ def run_claude(message: str, state: dict, chat_key: str) -> tuple[str, str | Non
         args += ["--resume", state[chat_key]]
     args.append(message)
 
-    log(f"running claude (resume={state.get(chat_key)})")
-    proc = subprocess.run(
+    log(f"running claude streaming (resume={state.get(chat_key)})")
+
+    proc = subprocess.Popen(
         args,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
+        bufsize=1,
         cwd=str(WORK_DIR),
-        timeout=CLAUDE_TIMEOUT_SEC,
     )
-    if proc.returncode != 0:
-        return f"[claude exit {proc.returncode}]\n{proc.stderr[:1500]}", None
+
+    new_session: str | None = None
+    final_text = ""
+    last_text = ""
+    last_status = ""
+    last_edit_ts = 0.0
+    deadline = time.monotonic() + CLAUDE_TIMEOUT_SEC
+
+    def maybe_edit(text: str, force: bool = False) -> None:
+        nonlocal last_edit_ts
+        if not status_id:
+            return
+        now = time.monotonic()
+        if not force and (now - last_edit_ts) < EDIT_THROTTLE_SEC:
+            return
+        edit(chat_id, status_id, text)
+        last_edit_ts = now
 
     try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return f"[non-JSON output]\n{proc.stdout[:2000]}", None
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            if time.monotonic() > deadline:
+                proc.kill()
+                return f"[timeout after {CLAUDE_TIMEOUT_SEC}s]", new_session
 
-    reply = data.get("result") or data.get("response") or "(no result key in JSON)"
-    new_session = data.get("session_id")
-    return reply, new_session
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            sid = ev.get("session_id")
+            if sid:
+                new_session = sid
+
+            t = ev.get("type")
+
+            if t == "system" and ev.get("subtype") == "init":
+                maybe_edit("status: started", force=True)
+                continue
+
+            if t == "assistant":
+                content = ev.get("message", {}).get("content", []) or []
+                for block in content:
+                    btype = block.get("type")
+                    if btype == "text":
+                        txt = block.get("text", "")
+                        if txt:
+                            final_text = txt
+                            if final_text != last_text:
+                                last_text = final_text
+                                maybe_edit(final_text[:TG_MAX])
+                    elif btype == "tool_use":
+                        label = _summarize_tool_input(block.get("name", "tool"), block.get("input", {}))
+                        status_msg = f"status: {label}"
+                        if status_msg != last_status:
+                            last_status = status_msg
+                            maybe_edit(status_msg, force=True)
+                    elif btype == "thinking":
+                        if last_status != "status: thinking":
+                            last_status = "status: thinking"
+                            maybe_edit(last_status)
+                continue
+
+            if t == "result":
+                final_from_result = ev.get("result")
+                if final_from_result:
+                    final_text = final_from_result
+                break
+
+        proc.wait(timeout=10)
+        if proc.returncode and proc.returncode != 0:
+            err = (proc.stderr.read() if proc.stderr else "") or ""
+            return f"[claude exit {proc.returncode}]\n{err[:1500]}", new_session
+
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return f"[timeout after {CLAUDE_TIMEOUT_SEC}s]", new_session
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    return final_text or "(no text produced)", new_session
 
 
 def handle_command(chat_id: int, chat_key: str, state: dict, text: str) -> bool:
@@ -182,9 +290,9 @@ def handle_update(update: dict, state: dict) -> None:
     if text.startswith("/") and handle_command(chat_id, chat_key, state, text):
         return
 
-    status_id = send(chat_id, "status: thinking")
+    status_id = send(chat_id, "status: starting")
     try:
-        reply, new_session = run_claude(text, state, chat_key)
+        reply, new_session = run_claude_streaming(text, state, chat_key, chat_id, status_id)
         if new_session:
             state[chat_key] = new_session
             save_state(state)
