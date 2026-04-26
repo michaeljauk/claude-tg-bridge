@@ -48,7 +48,7 @@ CLAW_WORK_DIR=/home/you/notes       # optional, the cwd the CLI runs in
 CLAUDE_TIMEOUT_SEC=600              # optional
 ```
 
-Optional: drop a `USER.md` in `~/.claude-tg-bridge/USER.md` — it's appended as system prompt on every call (persona, conventions, project context).
+Optional: drop a `USER.md` in `~/.claude-tg-bridge/USER.md` — it's appended as system prompt on every call (persona, conventions, project context). See [`USER.md.example`](USER.md.example) for bridge-specific patterns worth keeping (Telegram output formatting, background-dispatch for long tasks, progress pings).
 
 ## Run as a systemd user service
 

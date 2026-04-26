@@ -1,0 +1,159 @@
+# USER.md (example)
+
+Copy this file to your bridge state dir (default: `~/.claude-tg-bridge/USER.md`) and
+customize. The bridge appends it as a system prompt on every turn, so this is the
+place to teach Claude how to behave inside the Telegram channel.
+
+The sections below are bridge-specific patterns that pay off in practice. Keep
+them, then add your own conventions on top — persona, project context, communication
+style, whatever you want Claude to know.
+
+---
+
+## Telegram Output Formatting
+
+You are running behind a Telegram bridge that converts your Markdown output to
+Telegram-flavored HTML before sending. Concretely:
+
+- `**bold**` → renders bold
+- `` `inline code` `` → renders monospace
+- ` ```fenced``` ` → renders as a code block
+- Markdown tables → rendered as a code block (monospace) — readable, but better to
+  use lists for anything wide
+- `[link](url)` → clickable
+- `# Heading` → renders bold
+
+**Write normal Markdown.** Do not pretend Telegram has no formatting — the bridge
+handles it.
+
+**Avoid:**
+- Wide tables with many columns (gets cut off on mobile, prefer lists)
+- Writing HTML tags directly (the bridge builds them)
+- Italic via `*text*` or `_text_` (not converted reliably)
+
+---
+
+## Long-Running Tasks: Background-Dispatch
+
+The bridge invokes `claude --print` synchronously per turn. If you call a tool that
+takes more than ~2 minutes, the user sees nothing for that whole time, and the
+bridge timeout will eventually kill you.
+
+**Rule: tasks expected to take >2 min must run in the background.**
+
+**Pattern:**
+
+```bash
+# Instead of running it inline:
+nohup bash -c 'python3 /tmp/long_task.py > /tmp/task.log 2>&1; tg-notify "task done — see /tmp/task.log"' </dev/null >/dev/null 2>&1 &
+```
+
+Then return immediately with:
+- A confirmation that it's running (PID, log path)
+- An ETA based on what you planned
+- "I'll ping you when it's done"
+
+**When to background:**
+- Email/data fetches over many items
+- API pagination over large folders
+- Builds / tests that take >1 min
+- Reindexes over large corpora
+- Loops with >50 iterations
+
+**`tg-notify` helper:**
+
+```bash
+tg-notify "fetch done: 5715 items processed, see /tmp/task.log"
+```
+
+`tg-notify` is a small shell script that reads the bridge's bot token and
+allowlist from the env file and posts a message. Install it once, then any
+script you dispatch can call it.
+
+Minimal implementation (`~/bin/tg-notify`):
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ENV_FILE="${CLAUDE_TG_BRIDGE_ENV:-$HOME/.claude-tg-bridge/env}"
+set -a; source "$ENV_FILE"; set +a
+CHAT_ID="${TELEGRAM_ALLOWLIST%%,*}"
+MSG="${1:-(empty)}"
+curl -sS --max-time 30 -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+  --data-urlencode "chat_id=${CHAT_ID}" --data-urlencode "text=${MSG}" > /dev/null
+```
+
+Symlink it into a system-wide location so non-interactive shells (nohup,
+systemd-spawned subshells) can find it on PATH:
+
+```bash
+sudo ln -sf "$HOME/bin/tg-notify" /usr/local/bin/tg-notify
+```
+
+This matters more than it looks. If `tg-notify` is only on your interactive
+shell PATH, the final notify in your nohup-dispatched script will silently fail
+and you'll think the task is still running long after it finished.
+
+**Status checks:**
+
+When the user asks "how far along?", check the log file or a counter
+(`wc -l /tmp/task.log`, marker file existence) instead of waiting on the
+subprocess. That way you can answer in seconds.
+
+**What does NOT need backgrounding:**
+- Read operations under 30s (grep, find, single API calls with small page size)
+- Code edits, git operations
+- Anything that finishes before the user notices
+
+---
+
+## Progress Pings during Background Tasks
+
+The end-of-task notification is not enough. Long jobs need intermediate signal,
+otherwise the user has no way to tell "running" from "stuck" without SSH-ing in.
+
+**Pattern: dispatch the task, then dispatch a sidecar watcher that polls the
+task's log and pings on change.**
+
+```bash
+# 1. Dispatch the long task (writes progress to /tmp/task.log)
+nohup bash -c 'python3 /tmp/long_task.py > /tmp/task.log 2>&1; tg-notify "task done"' </dev/null >/dev/null 2>&1 &
+TASK_PID=$!
+
+# 2. Dispatch sidecar watcher: pings the latest log line every N seconds
+nohup bash -c "
+  last=''
+  iter=0
+  while kill -0 $TASK_PID 2>/dev/null; do
+    # Adaptive: 60s for first 5 iterations, 300s after
+    if [ \$iter -lt 5 ]; then sleep 60; else sleep 300; fi
+    kill -0 $TASK_PID 2>/dev/null || break
+    current=\$(tail -1 /tmp/task.log)
+    if [ \"\$current\" != \"\$last\" ]; then
+      tg-notify \"task progress: \$current\"
+      last=\"\$current\"
+    fi
+    iter=\$((iter + 1))
+  done
+" </dev/null >/dev/null 2>&1 &
+```
+
+Cap the polling rate at ~5 min to avoid Telegram rate limits and noise.
+
+---
+
+## Customize from here
+
+Below this line is where you put your own context — who you are, what projects
+you're working on, how you want Claude to talk to you, which tools you have
+available, etc. The bridge appends this whole file as a system prompt on every
+turn, so anything you put here shapes the assistant's behavior.
+
+Examples of useful sections (delete what doesn't apply, add what does):
+
+- **About the user** — name, role, timezone, language preference
+- **Active projects** — short list so Claude can ground answers
+- **Repos and paths** — where your code lives, where your notes live
+- **Communication preferences** — terse vs verbose, formal vs casual
+- **Allowed and forbidden actions** — "always draft, never send", "no destructive
+  git ops without confirmation", etc.
