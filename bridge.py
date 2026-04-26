@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""claude-tg-bridge — Telegram <-> claude --print.
+"""claude-tg-bridge — Telegram <-> claude CLI.
 
-A minimal bridge that lets you talk to your Claude Max plan from Telegram.
-Subprocesses the official Claude CLI (`claude --print`), so traffic routes
-through your Plan tokens, not OAuth/API credits.
+A small, personal Telegram bridge for the official Claude CLI. The bot
+subprocesses `claude --print --output-format=json` and forwards results
+back to Telegram, so it behaves like running claude in your terminal —
+same context, same files, same auth.
 
 Allowlist-gated. Per-chat session continuity via state.json (resume by
 session_id returned in --output-format=json).
