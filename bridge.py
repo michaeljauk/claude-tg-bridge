@@ -394,7 +394,7 @@ def handle_update(update: dict, state: dict) -> None:
     if text.startswith("/") and handle_command(chat_id, chat_key, state, text):
         return
 
-    status_id = send(chat_id, "status: starting")
+    status_id = send(chat_id, "⏱ 0s · starting")
     try:
         reply, new_session = run_claude_streaming(text, state, chat_key, chat_id, status_id)
         if new_session:
