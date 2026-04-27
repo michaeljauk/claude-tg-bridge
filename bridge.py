@@ -68,10 +68,20 @@ def log(*parts: object) -> None:
 def load_state() -> dict:
     if STATE_FILE.exists():
         try:
-            return json.loads(STATE_FILE.read_text())
+            raw = json.loads(STATE_FILE.read_text())
         except json.JSONDecodeError:
             log("state.json corrupt — starting fresh")
+            return {}
+        return {_migrate_chat_key(k): v for k, v in raw.items()}
     return {}
+
+
+def _migrate_chat_key(key: str) -> str:
+    """Pre-Topics keys looked like '6133022184' (chat_id only). New format is
+    'chat_id:thread_id', with thread_id 0 meaning the General/non-topic stream.
+    Old single-int keys are migrated to ':0' so existing sessions resume cleanly.
+    """
+    return key if ":" in key else f"{key}:0"
 
 
 _state_lock = threading.Lock()
@@ -227,8 +237,10 @@ def _send_or_edit(method: str, payload: dict) -> dict:
     return res
 
 
-def send(chat_id: int, text: str) -> int | None:
+def send(chat_id: int, text: str, thread_id: int = 0) -> int | None:
     payload = {"chat_id": chat_id, "text": md_to_html(text[:TG_MAX])}
+    if thread_id:
+        payload["message_thread_id"] = thread_id
     res = _send_or_edit("sendMessage", payload)
     if not res.get("ok"):
         log("sendMessage failed", res)
@@ -250,12 +262,12 @@ def edit(chat_id: int, message_id: int, text: str) -> None:
         log("editMessageText failed", res)
 
 
-def send_chunked(chat_id: int, text: str) -> None:
+def send_chunked(chat_id: int, text: str, thread_id: int = 0) -> None:
     if len(text) <= TG_MAX:
-        send(chat_id, text or "(empty reply)")
+        send(chat_id, text or "(empty reply)", thread_id=thread_id)
         return
     for i in range(0, len(text), TG_MAX):
-        send(chat_id, text[i : i + TG_MAX])
+        send(chat_id, text[i : i + TG_MAX], thread_id=thread_id)
 
 
 EDIT_THROTTLE_SEC = 1.5
@@ -446,24 +458,33 @@ def run_claude_streaming(
     return state_box["text"] or "(no text produced)", new_session
 
 
-def handle_command(chat_id: int, chat_key: str, state: dict, text: str) -> bool:
+def handle_command(
+    chat_id: int, chat_key: str, state: dict, text: str, thread_id: int = 0
+) -> bool:
     cmd = text.strip().lower()
     if cmd in ("/new", "/reset", "/start"):
         state.pop(chat_key, None)
         save_state(state)
-        send(chat_id, "fresh session ready.")
+        send(chat_id, "fresh session ready.", thread_id=thread_id)
         return True
     if cmd == "/status":
         sid = state.get(chat_key, "(none)")
-        send(chat_id, f"session: {sid}\nmodel: {CLAUDE_MODEL}\nwork-dir: {WORK_DIR}")
+        send(
+            chat_id,
+            f"session: {sid}\nthread: {thread_id or 'general'}\n"
+            f"model: {CLAUDE_MODEL}\nwork-dir: {WORK_DIR}",
+            thread_id=thread_id,
+        )
         return True
     if cmd == "/help":
         send(
             chat_id,
-            "/new — start a fresh session\n"
+            "/new — start a fresh session in this topic\n"
             "/status — current session id + config\n"
             "/help — this message\n"
-            "anything else — sent to claude",
+            "anything else — sent to claude\n\n"
+            "tip: in a forum-topic supergroup, each topic keeps its own session.",
+            thread_id=thread_id,
         )
         return True
     return False
@@ -480,11 +501,17 @@ def handle_update(update: dict, state: dict) -> None:
         log(f"reject user_id={user_id}")
         return
 
-    chat_key = str(chat_id)
+    # Forum-topic supergroups attach message_thread_id; DMs and non-topic
+    # groups don't. Treat missing/General as thread 0 so each topic owns its
+    # own session and main-slot, while legacy DM behavior is preserved.
+    thread_id = msg.get("message_thread_id") or 0
+    chat_key = f"{chat_id}:{thread_id}"
 
     text, files = extract_message_input(msg)
 
-    if text.startswith("/") and handle_command(chat_id, chat_key, state, text):
+    if text.startswith("/") and handle_command(
+        chat_id, chat_key, state, text, thread_id=thread_id
+    ):
         return
 
     if not text and not files:
@@ -499,7 +526,7 @@ def handle_update(update: dict, state: dict) -> None:
 
     is_main = claim_main_slot(chat_key)
     initial_status = "⏱ 0s · starting" if is_main else "⏱ 0s · sidebar · starting"
-    status_id = send(chat_id, initial_status)
+    status_id = send(chat_id, initial_status, thread_id=thread_id)
     try:
         reply, new_session = run_claude_streaming(
             prompt, state, chat_key, chat_id, status_id, is_sidebar=not is_main
@@ -512,20 +539,20 @@ def handle_update(update: dict, state: dict) -> None:
         else:
             if status_id:
                 edit(chat_id, status_id, "status: done")
-            send_chunked(chat_id, reply)
+            send_chunked(chat_id, reply, thread_id=thread_id)
     except subprocess.TimeoutExpired:
         msg_text = f"[timeout after {CLAUDE_TIMEOUT_SEC}s]"
         if status_id:
             edit(chat_id, status_id, msg_text)
         else:
-            send(chat_id, msg_text)
+            send(chat_id, msg_text, thread_id=thread_id)
     except Exception as e:  # noqa: BLE001
         log("handler error", traceback.format_exc())
         err = f"[bridge error] {e}"
         if status_id:
             edit(chat_id, status_id, err)
         else:
-            send(chat_id, err)
+            send(chat_id, err, thread_id=thread_id)
     finally:
         if is_main:
             release_main_slot(chat_key)
