@@ -72,7 +72,10 @@ def load_state() -> dict:
         except json.JSONDecodeError:
             log("state.json corrupt — starting fresh")
             return {}
-        return {_migrate_chat_key(k): v for k, v in raw.items()}
+        return {
+            (k if k.startswith("_") else _migrate_chat_key(k)): v
+            for k, v in raw.items()
+        }
     return {}
 
 
@@ -80,6 +83,7 @@ def _migrate_chat_key(key: str) -> str:
     """Pre-Topics keys looked like '6133022184' (chat_id only). New format is
     'chat_id:thread_id', with thread_id 0 meaning the General/non-topic stream.
     Old single-int keys are migrated to ':0' so existing sessions resume cleanly.
+    Keys starting with '_' are reserved metadata and pass through untouched.
     """
     return key if ":" in key else f"{key}:0"
 
@@ -121,6 +125,28 @@ def save_state(state: dict) -> None:
 def tg(method: str, payload: dict) -> dict:
     r = requests.post(f"{API}/{method}", json=payload, timeout=30)
     return r.json()
+
+
+def tg_create_topic(chat_id: int, name: str) -> int | None:
+    """Create a new forum topic in a supergroup. Bot needs Manage Topics
+    admin permission. Returns the new message_thread_id, or None on failure.
+    """
+    res = tg("createForumTopic", {"chat_id": chat_id, "name": name[:128]})
+    if not res.get("ok"):
+        log("createForumTopic failed", res)
+        return None
+    return res["result"].get("message_thread_id")
+
+
+def tg_close_topic(chat_id: int, thread_id: int) -> bool:
+    res = tg("closeForumTopic", {
+        "chat_id": chat_id,
+        "message_thread_id": thread_id,
+    })
+    if not res.get("ok"):
+        log("closeForumTopic failed", res)
+        return False
+    return True
 
 
 _FILENAME_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -461,7 +487,12 @@ def run_claude_streaming(
 def handle_command(
     chat_id: int, chat_key: str, state: dict, text: str, thread_id: int = 0
 ) -> bool:
-    cmd = text.strip().lower()
+    # In groups, Telegram appends @bot_username to slash commands ("/status"
+    # becomes "/status@michaeljauk_claw_bot"). Strip it, then split off any
+    # argument after whitespace.
+    head, _, rest = text.strip().partition(" ")
+    cmd = head.split("@", 1)[0].lower()
+    arg = rest.strip()
     if cmd in ("/new", "/reset", "/start"):
         state.pop(chat_key, None)
         save_state(state)
@@ -471,23 +502,64 @@ def handle_command(
         sid = state.get(chat_key, "(none)")
         send(
             chat_id,
-            f"session: {sid}\nthread: {thread_id or 'general'}\n"
+            f"session: {sid}\nchat: {chat_id}\nthread: {thread_id or 'general'}\n"
             f"model: {CLAUDE_MODEL}\nwork-dir: {WORK_DIR}",
             thread_id=thread_id,
         )
         return True
+    if cmd == "/topic":
+        return _handle_topic_command(chat_id, state, arg, thread_id)
     if cmd == "/help":
         send(
             chat_id,
             "/new — start a fresh session in this topic\n"
             "/status — current session id + config\n"
+            "/topic <name> — create a new forum topic (supergroup only)\n"
+            "/topic close — close the current topic (state is kept)\n"
+            "/topic list — list known topic sessions\n"
             "/help — this message\n"
-            "anything else — sent to claude\n\n"
-            "tip: in a forum-topic supergroup, each topic keeps its own session.",
+            "anything else — sent to claude",
             thread_id=thread_id,
         )
         return True
     return False
+
+
+def _handle_topic_command(
+    chat_id: int, state: dict, arg: str, thread_id: int
+) -> bool:
+    if arg == "list":
+        prefix = f"{chat_id}:"
+        keys = [k for k in state if isinstance(k, str) and k.startswith(prefix)]
+        if not keys:
+            send(chat_id, "no topic sessions yet.", thread_id=thread_id)
+            return True
+        lines = [f"thread {k.split(':', 1)[1]}: {state[k][:8]}…" for k in sorted(keys)]
+        send(chat_id, "topic sessions:\n" + "\n".join(lines), thread_id=thread_id)
+        return True
+    if arg == "close":
+        if not thread_id:
+            send(chat_id, "can't close the General/main thread.", thread_id=thread_id)
+            return True
+        if tg_close_topic(chat_id, thread_id):
+            send(chat_id, "topic closed (session retained — reopen + /new to drop).", thread_id=thread_id)
+        else:
+            send(chat_id, "close failed (admin perms?).", thread_id=thread_id)
+        return True
+    if not arg:
+        send(chat_id, "usage: /topic <name> | /topic close | /topic list", thread_id=thread_id)
+        return True
+    new_thread = tg_create_topic(chat_id, arg)
+    if new_thread:
+        send(chat_id, f"topic '{arg}' ready.", thread_id=new_thread)
+    else:
+        send(
+            chat_id,
+            "topic creation failed (bot needs Manage Topics admin permission, "
+            "and the chat must be a supergroup with Topics enabled).",
+            thread_id=thread_id,
+        )
+    return True
 
 
 def handle_update(update: dict, state: dict) -> None:
@@ -506,6 +578,14 @@ def handle_update(update: dict, state: dict) -> None:
     # own session and main-slot, while legacy DM behavior is preserved.
     thread_id = msg.get("message_thread_id") or 0
     chat_key = f"{chat_id}:{thread_id}"
+    chat_type = msg.get("chat", {}).get("type", "")
+    log(f"chat={chat_id} type={chat_type} thread={thread_id} user={user_id}")
+
+    # Cache the supergroup chat_id once so helper scripts (tg-topic) can
+    # operate without manual env config.
+    if chat_type in ("supergroup", "group") and state.get("_group_chat_id") != chat_id:
+        state["_group_chat_id"] = chat_id
+        save_state(state)
 
     text, files = extract_message_input(msg)
 

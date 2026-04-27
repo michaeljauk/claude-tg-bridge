@@ -10,6 +10,7 @@ Run it on a small VPS (or a Pi). Lock it to your own Telegram user ID. Point it 
 - **Allowlist-only** — refuses to start without an allowlist; refuses to reply to anyone else
 - **Per-chat session continuity** — picks up `session_id` from the CLI and `--resume`s on the next message, so the conversation keeps its memory
 - **Forum-topic aware** — in supergroups with Topics enabled, each topic carries its own session and main-slot, so parallel conversations don't bleed into each other (one topic = email triage, another = code review, etc.)
+- **Topic management** — `/topic <name>` creates a topic, `/topic close` closes the current one, `/topic list` shows known sessions. Bot needs Manage Topics admin permission. Ships `tg-topic` shell helper so the assistant itself can spawn topics + cross-post from inside its subprocess.
 - **Optional persona** — drop a `USER.md` into the state dir; it's appended as system prompt
 - **Slash commands** — `/new` (fresh session), `/status`, `/help`
 - **Long replies handled** — Telegram's 4096-char limit is split into chunks

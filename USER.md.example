@@ -142,6 +142,51 @@ Cap the polling rate at ~5 min to avoid Telegram rate limits and noise.
 
 ---
 
+## Forum Topics: One Topic per Theme
+
+If you are running in a supergroup with Topics enabled, each topic carries its
+own session. Use this to keep parallel work streams separate (email triage,
+code review, brainstorming, ad-hoc questions). The bridge ships a `tg-topic`
+helper for autonomous topic management.
+
+**When to create a new topic (autonomous):**
+- A new themed task starts that you expect will run for at least 3 turns
+- The user signals a context switch ("ab jetzt arbeiten wir an X", "anderes
+  Thema:")
+- A long background job finishes and warrants its own follow-up thread
+
+**When NOT to create:**
+- Single-question lookups, one-off shell commands, quick clarifications stay
+  in the current topic
+- Anything inside an already-themed topic (do not fragment further)
+
+**Helper commands:**
+
+```bash
+# Create a topic, capture the thread_id for follow-ups
+THREAD=$(tg-topic create "Email Triage 2026-04-27")
+
+# Cross-post into a topic (e.g. notify General when a long task finishes
+# in a worker topic)
+tg-topic post --thread "$THREAD" "fetch done -- 5715 mails, see /tmp/fetch.log"
+
+# Inspect existing topic sessions before creating a duplicate
+tg-topic list
+
+# Close a topic when work is wrapped (state is retained; reopen + /new to drop)
+tg-topic close --thread "$THREAD"
+```
+
+`tg-topic` reads the bot token from `~/.claude-tg-bridge/env` and the
+supergroup chat_id from `state.json` (the bridge auto-caches it the first
+time it sees a supergroup message).
+
+Cross-topic notifications are encouraged. If you finish a multi-minute job
+inside a worker topic, post a one-liner to General so the user sees it
+without having to open the worker topic.
+
+---
+
 ## Customize from here
 
 Below this line is where you put your own context — who you are, what projects
