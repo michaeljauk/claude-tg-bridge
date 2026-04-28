@@ -640,12 +640,9 @@ def handle_update(update: dict, state: dict) -> None:
         if is_main and new_session:
             state[chat_key] = new_session
             save_state(state)
-        if status_id and len(reply) <= TG_MAX:
-            edit(chat_id, status_id, reply or "(empty)")
-        else:
-            if status_id:
-                edit(chat_id, status_id, "status: done")
-            send_chunked(chat_id, reply, thread_id=thread_id)
+        if status_id:
+            edit(chat_id, status_id, "done ✓")
+        send_chunked(chat_id, reply, thread_id=thread_id)
     except subprocess.TimeoutExpired:
         msg_text = f"[timeout after {CLAUDE_TIMEOUT_SEC}s]"
         if status_id:
