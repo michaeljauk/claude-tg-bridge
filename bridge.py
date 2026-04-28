@@ -273,23 +273,33 @@ def md_to_html(text: str) -> str:
     return re.sub(r"\x00(\d+)\x00", restore, text)
 
 
-def _send_or_edit(method: str, payload: dict) -> dict:
-    """Try with HTML parse_mode; on parse error retry as plain text."""
+def _send_or_edit(method: str, payload: dict, retry: bool = False) -> dict:
+    """Try with HTML parse_mode; on parse error retry as plain text.
+    If retry=True, honour Telegram's retry_after on 429 (once) so critical
+    messages (final reply) are not silently dropped.
+    """
     res = tg(method, {**payload, "parse_mode": "HTML"})
     if res.get("ok"):
         return res
+    # Rate-limited — wait and retry once for critical sends
+    if retry and res.get("error_code") == 429:
+        wait = (res.get("parameters") or {}).get("retry_after", 30)
+        log(f"rate-limited, retrying after {wait}s")
+        time.sleep(min(wait, 60))
+        res = tg(method, {**payload, "parse_mode": "HTML"})
+        if res.get("ok"):
+            return res
     desc = (res.get("description") or "").lower()
     if "parse" in desc and ("entit" in desc or "tag" in desc):
-        # malformed HTML — fall back to plain text so the message still lands
         return tg(method, payload)
     return res
 
 
-def send(chat_id: int, text: str, thread_id: int = 0) -> int | None:
+def send(chat_id: int, text: str, thread_id: int = 0, retry: bool = False) -> int | None:
     payload = {"chat_id": chat_id, "text": md_to_html(text[:TG_MAX])}
     if thread_id:
         payload["message_thread_id"] = thread_id
-    res = _send_or_edit("sendMessage", payload)
+    res = _send_or_edit("sendMessage", payload, retry=retry)
     if not res.get("ok"):
         log("sendMessage failed", res)
         return None
@@ -312,14 +322,14 @@ def edit(chat_id: int, message_id: int, text: str) -> None:
 
 def send_chunked(chat_id: int, text: str, thread_id: int = 0) -> None:
     if len(text) <= TG_MAX:
-        send(chat_id, text or "(empty reply)", thread_id=thread_id)
+        send(chat_id, text or "(empty reply)", thread_id=thread_id, retry=True)
         return
     for i in range(0, len(text), TG_MAX):
-        send(chat_id, text[i : i + TG_MAX], thread_id=thread_id)
+        send(chat_id, text[i : i + TG_MAX], thread_id=thread_id, retry=True)
 
 
-EDIT_THROTTLE_SEC = 1.5
-TICKER_INTERVAL_SEC = 5.0
+EDIT_THROTTLE_SEC = 8.0
+TICKER_INTERVAL_SEC = 10.0
 TOOL_INPUT_PREVIEW_LEN = 80
 
 
