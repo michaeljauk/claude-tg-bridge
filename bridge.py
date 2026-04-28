@@ -210,6 +210,28 @@ def extract_message_input(msg: dict) -> tuple[str, list[Path]]:
     return text, files
 
 
+def extract_reply_context(msg: dict) -> str:
+    """Surface the quoted text when this message is a Telegram reply.
+
+    Returned as a single bracketed line that's prepended to the prompt so
+    claude knows what the user is referencing, even if the original message
+    fell out of the session's context window or lives in another topic.
+    Filters out the forum_topic_created sentinel that Telegram attaches as
+    reply_to on the first message of some topics.
+    """
+    reply = msg.get("reply_to_message") or {}
+    if not reply or reply.get("forum_topic_created"):
+        return ""
+    quoted = (reply.get("text") or reply.get("caption") or "").strip()
+    if not quoted:
+        return ""
+    sender = reply.get("from") or {}
+    name = sender.get("username") or sender.get("first_name") or "someone"
+    if len(quoted) > 1000:
+        quoted = quoted[:997] + "…"
+    return f"[replying to {name}: {quoted}]"
+
+
 _TABLE_RE = re.compile(
     r"(^\|.*\|[ \t]*\n^\|[\s\-:|]+\|[ \t]*\n(?:^\|.*\|[ \t]*\n?)+)",
     re.MULTILINE,
@@ -603,6 +625,10 @@ def handle_update(update: dict, state: dict) -> None:
         prompt = f"{refs}\n\n{prompt_caption}"
     else:
         prompt = text
+
+    reply_ctx = extract_reply_context(msg)
+    if reply_ctx:
+        prompt = f"{reply_ctx}\n\n{prompt}"
 
     is_main = claim_main_slot(chat_key)
     initial_status = "⏱ 0s · starting" if is_main else "⏱ 0s · sidebar · starting"
